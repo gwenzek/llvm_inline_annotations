@@ -23,7 +23,6 @@ pub fn addAnalysis(b: *std.Build, exe: *std.Build.Step.Compile) std.Build.LazyPa
 /// Analyze `exe`, then annotate files inside `workspace` in place.
 /// Pass null to use the executable's build root. Attach the returned run step
 /// to an explicit build step; it always runs because it modifies source files.
-/// The run step accepts additional CLI flags such as --check or --remove.
 pub fn addAnnotations(b: *std.Build, report: std.Build.LazyPath, workspace: ?std.Build.LazyPath) *std.Build.Step.Run {
     const run = b.addRunArtifact(analyzer(b, b.graph.host, .safe));
     run.addArgs(&.{ "apply", "--report" });

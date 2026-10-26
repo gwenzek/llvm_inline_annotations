@@ -8,6 +8,16 @@ Following annotations are emitted:
 - *memset*: memset emitted by Zig, but not removed by LLVM optimization passes
 - *not inlined*: function call that aren't inlined
 
+Apply annotations directly from optimized LLVM IR:
+
+```sh
+llvm-inline-annotations apply --ir input.ll
+```
+
+The analysis report stays in memory. Alternatively, use `--report analysis.json`
+to apply a saved report. Specify exactly one of `--ir` or `--report`.
+Add `--clean` to remove existing annotations from the files referenced by the analysis.
+
 ## Zig build integration
 
 Add this package as a dependency named `llvm_inline_annotations`, then:
