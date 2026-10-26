@@ -1,5 +1,66 @@
 # LLVM inline annotations
 
+The native analyzer is written for **Zig 0.17.0**. It generates the same version-1
+JSON reports and supports the same `analyze` and `apply` commands as `analyzer.py`.
+Python is retained as a compatibility reference and for the existing Bazel rules;
+the Zig executable has no Python dependency.
+
+```sh
+zig build
+zig build run -- analyze --ir program.ll --manifest sources.json --output report.json
+zig build run -- apply --report report.json --workspace "$PWD" --prefix src --check
+zig build test test-integration
+zig build example-report  # writes zig-out/analysis.json
+```
+
+`test-integration` requires Python 3 and compares the reports against the Python
+implementation, then tests annotation, removal, stale-source rejection, and path
+containment through the Zig CLI. `test` runs native Zig unit tests.
+
+A manifest maps workspace-relative names to readable source paths, for example
+`{"src/main.zig": "/checkout/src/main.zig"}`. Alternatively, pass repeated
+`--source src/main.zig /checkout/src/main.zig` pairs. Multiple `--ir` inputs merge
+into one report. Source paths passed this way may be generated build outputs.
+
+## Zig build integration
+
+Add this package as a dependency named `llvm_inline_annotations` in your
+`build.zig.zon`. After creating your executable in `build.zig`:
+
+```zig
+const annotations = @import("llvm_inline_annotations");
+
+// Inside build(b), after defining exe:
+const dep = b.dependency("llvm_inline_annotations", .{});
+const report = annotations.addAnalysis(dep.builder, exe, .{
+    .sources = &.{
+        .{ .name = "src/main.zig", .path = b.path("src/main.zig") },
+        .{ .name = "src/model.zig", .path = b.path("src/model.zig") },
+    },
+    .output_name = "program-analysis.json", // optional; default: analysis.json
+});
+const install_report = b.addInstallFile(report, "program-analysis.json");
+b.step("analyze", "Analyze the executable's optimized LLVM IR")
+    .dependOn(&install_report.step);
+```
+
+`addAnalysis(b, exe, options)` returns a `std.Build.LazyPath` that can be installed
+or passed to another build step. Pass the **dependency's builder** as its first
+argument so it can locate `analyzer.zig`. When calling from this package itself,
+pass `b`. Source names must be workspace-relative; supply every source you want
+included in the report. Calls outside that set are counted as unmapped.
+
+The helper enables LLVM and debug information on the supplied executable and its
+module graph, upgrading Debug or unspecified optimization to ReleaseSafe. Other
+release modes are preserved. These settings also affect any other artifacts that
+share those modules. Call it after configuring imports. The analyzer runs on the
+host even if `exe` targets another platform; the executable itself is never run.
+Source files and emitted LLVM IR are build inputs, so changes invalidate the
+cached report. Report generation does not annotate source files; use `apply`
+explicitly for that.
+
+## Existing Bazel workflow
+
 Inspect the optimized Zig IR for `//examples/llm:llm` and annotate ZML:
 
 ```sh
