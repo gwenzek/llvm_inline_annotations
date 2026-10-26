@@ -1,6 +1,5 @@
 const usage =
-    \\Usage: llvm-inline-annotations analyze --ir FILE [--ir FILE ...] --manifest FILE --output FILE
-    \\       llvm-inline-annotations analyze --ir FILE --source NAME PATH [--source NAME PATH ...] --output FILE
+    \\Usage: llvm-inline-annotations analyze --ir FILE --output FILE
     \\       llvm-inline-annotations apply --report FILE --workspace DIR [--prefix DIR ...] [--remove] [--check]
     \\
 ;
@@ -21,10 +20,8 @@ pub fn main(init: std.process.Init) !void {
     const analyzing = std.mem.eql(u8, args[1], "analyze");
     if (!analyzing and !std.mem.eql(u8, args[1], "apply")) return error.InvalidArguments;
 
-    var ir: std.ArrayList([]const u8) = .empty;
+    var ir: ?[]const u8 = null;
     var prefixes: std.ArrayList([]const u8) = .empty;
-    var direct_sources = json.Value{ .object = .{} };
-    var manifest: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var report_path: ?[]const u8 = null;
     var workspace: ?[]const u8 = init.environ_map.get("BUILD_WORKSPACE_DIRECTORY");
@@ -48,16 +45,9 @@ pub fn main(init: std.process.Init) !void {
         i += 1;
         if (i >= args.len) return error.InvalidArguments;
         const value = args[i];
-        if (analyzing and std.mem.eql(u8, arg, "--source")) {
-            i += 1;
-            if (i >= args.len or !validSource(value)) return error.InvalidArguments;
-            try direct_sources.object.put(a, value, .{ .string = args[i] });
-            continue;
-        }
         if (analyzing and std.mem.eql(u8, arg, "--ir")) {
-            try ir.append(a, value);
-        } else if (analyzing and std.mem.eql(u8, arg, "--manifest")) {
-            manifest = value;
+            if (ir != null) return error.InvalidArguments;
+            ir = value;
         } else if (analyzing and std.mem.eql(u8, arg, "--output")) {
             output = value;
         } else if (!analyzing and std.mem.eql(u8, arg, "--report")) {
@@ -69,15 +59,9 @@ pub fn main(init: std.process.Init) !void {
         } else return error.InvalidArguments;
     }
     if (analyzing) {
-        if (ir.items.len == 0 or (manifest == null and direct_sources.object.count() == 0) or output == null) return error.InvalidArguments;
-        var sources: json.Value = .{ .object = .{} };
-        if (manifest) |path| {
-            const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
-            sources = (try json.parseFromSlice(json.Value, a, contents, .{ .allocate = .alloc_always })).value;
-        }
-        if (sources != .object) return error.InvalidManifest;
-        for (direct_sources.object.keys(), direct_sources.object.values()) |key, value| try sources.object.put(a, key, value);
-        const report = try analyze(a, io, ir.items, sources);
+        const ir_path = try std.Io.Dir.cwd().realPathFileAlloc(io, ir orelse return error.InvalidArguments, a);
+        if (output == null) return error.InvalidArguments;
+        const report = try analyze(a, io, ir_path);
         const file = try std.Io.Dir.cwd().createFile(io, output.?, .{});
         defer file.close(io);
         var buffer: [4096]u8 = undefined;
@@ -85,12 +69,7 @@ pub fn main(init: std.process.Init) !void {
         try json.Stringify.value(report, .{ .whitespace = .indent_2 }, &writer.interface);
         try writer.interface.writeByte('\n');
         try writer.interface.flush();
-        const unmapped = report.object.get("unmapped").?.object;
-        std.debug.print("Found {d} source diagnostics; {d} calls without debug locations; {d} calls outside sources\n", .{
-            report.object.get("diagnostics").?.array.items.len,
-            unmapped.get("calls_without_debug_location").?.integer,
-            unmapped.get("calls_outside_sources").?.integer,
-        });
+        std.debug.print("Found {d} diagnostics\n", .{report.object.get("diagnostics").?.array.items.len});
     } else {
         if (report_path == null or workspace == null) return error.InvalidArguments;
         if (prefixes.items.len == 0) try prefixes.append(a, "zml");
@@ -213,10 +192,9 @@ const Node = struct { kind: []const u8, fields: std.StringHashMap([]const u8) };
 const DebugInfo = struct {
     a: Allocator,
     nodes: std.StringHashMap(Node),
-    sources: json.Value,
     cache: std.StringHashMap(?[]const u8),
-    fn init(a: Allocator, text: []const u8, sources: json.Value) !DebugInfo {
-        var self = DebugInfo{ .a = a, .nodes = .init(a), .sources = sources, .cache = .init(a) };
+    fn init(a: Allocator, text: []const u8) !DebugInfo {
+        var self = DebugInfo{ .a = a, .nodes = .init(a), .cache = .init(a) };
         var lines = Lines{ .text = text };
         var units: usize = 0;
         while (lines.next()) |raw| {
@@ -249,13 +227,9 @@ const DebugInfo = struct {
         if (std.mem.eql(u8, node.kind, "DIFile")) {
             const filename = try unquote(self.a, node.fields.get("filename") orelse "");
             const directory = try unquote(self.a, node.fields.get("directory") orelse "");
-            const path = try std.fs.path.resolvePosix(self.a, &.{ "/", directory, filename });
-            if (std.mem.indexOf(u8, path, "/external/") == null) {
-                for (self.sources.object.keys()) |source| {
-                    if (std.mem.endsWith(u8, path, source) and path.len > source.len and path[path.len - source.len - 1] == '/') {
-                        if (result == null or source.len > result.?.len) result = source;
-                    }
-                }
+            if (filename.len != 0) {
+                const path = if (std.fs.path.isAbsolutePosix(filename) or directory.len == 0) filename else try std.fmt.allocPrint(self.a, "{s}/{s}", .{ std.mem.trimEnd(u8, directory, "/"), filename });
+                result = path;
             }
         } else {
             result = try self.sourceFile(node.fields.get("file") orelse node.fields.get("scope") orelse "", depth + 1);
@@ -402,131 +376,103 @@ fn diagnosticLess(_: void, lhs: json.Value, rhs: json.Value) bool {
 }
 const Analysis = struct {
     a: Allocator,
-    sources: json.Value,
-    line_counts: std.StringHashMap(usize),
     diagnostics: std.StringHashMap(json.Value),
-    invalid: std.StringHashMap(json.Value),
     no_debug: usize = 0,
-    outside: usize = 0,
-    fn record(self: *Analysis, debug: *DebugInfo, instruction: []const u8, ir: []const u8, ir_line: usize, function: ?[]const u8) !void {
+    unresolved_debug: usize = 0,
+
+    fn record(self: *Analysis, debug: *DebugInfo, instruction: []const u8, ir_line: usize, ir_column: usize, function: ?[]const u8) !void {
         var op = (try operation(self.a, instruction)) orelse return;
-        const dbg_start = std.mem.indexOf(u8, instruction, "!dbg !") orelse {
+        var source: []const u8 = "";
+        var line: usize = 0;
+        var column: usize = 0;
+        if (std.mem.indexOf(u8, instruction, "!dbg !")) |dbg_start| {
+            const start = dbg_start + 5;
+            var end = start + 1;
+            while (end < instruction.len and std.ascii.isDigit(instruction[end])) : (end += 1) {}
+            if (debug.nodes.get(instruction[start..end])) |node| {
+                if (std.mem.eql(u8, node.kind, "DILocation")) {
+                    source = try debug.sourceFile(node.fields.get("scope") orelse "", 0) orelse "";
+                    line = std.fmt.parseInt(usize, node.fields.get("line") orelse "0", 10) catch 0;
+                    column = std.fmt.parseInt(usize, node.fields.get("column") orelse "0", 10) catch 0;
+                }
+            }
+            if (source.len == 0 or line == 0) self.unresolved_debug += 1;
+        } else {
             self.no_debug += 1;
-            return;
-        };
-        const start = dbg_start + 5;
-        var end = start + 1;
-        while (end < instruction.len and std.ascii.isDigit(instruction[end])) : (end += 1) {}
-        const node = debug.nodes.get(instruction[start..end]) orelse {
-            self.outside += 1;
-            return;
-        };
-        const source = try debug.sourceFile(node.fields.get("scope") orelse "", 0);
-        const line = (std.fmt.parseInt(usize, node.fields.get("line") orelse "0", 10) catch 0);
-        if (!std.mem.eql(u8, node.kind, "DILocation") or source == null or line == 0) {
-            self.outside += 1;
-            return;
         }
-        try op.object.put(self.a, "path", .{ .string = source.? });
+        try op.object.put(self.a, "path", .{ .string = source });
         try op.object.put(self.a, "line", .{ .integer = @intCast(line) });
-        if (line > self.line_counts.get(source.?).?) {
-            var invalid = json.Value{ .object = .{} };
-            try invalid.object.put(self.a, "path", .{ .string = source.? });
-            try invalid.object.put(self.a, "line", .{ .integer = @intCast(line) });
-            try self.invalid.put(try json.Stringify.valueAlloc(self.a, invalid, .{}), invalid);
-            return;
-        }
-        // JSON array keys avoid ambiguities from punctuation in source/symbol names.
-        const key = try json.Stringify.valueAlloc(self.a, .{ source.?, line, op.object.get("kind").?.string, if (op.object.get("callee")) |callee_name| callee_name.string else "" }, .{});
-        if (op.object.contains("bytes")) {
-            const previous = self.diagnostics.get(key);
-            var instances = if (previous) |p| p.object.get("instances").? else json.Value{ .array = std.array_list.Managed(json.Value).init(self.a) };
-            var instance = json.Value{ .object = .{} };
-            try instance.object.put(self.a, "ir", .{ .string = ir });
-            try instance.object.put(self.a, "ir_line", .{ .integer = @intCast(ir_line) });
-            try instance.object.put(self.a, "function", if (function) |f| .{ .string = f } else .null);
-            try instance.object.put(self.a, "column", .{ .integer = @intCast((std.fmt.parseInt(usize, node.fields.get("column") orelse "0", 10) catch 0)) });
-            try instance.object.put(self.a, "instruction", .{ .string = instruction });
-            try instance.object.put(self.a, "bytes", op.object.get("bytes").?);
-            try instances.array.append(instance);
-            try op.object.put(self.a, "instances", instances);
-            try op.object.put(self.a, "instance_count", .{ .integer = @intCast(instances.array.items.len) });
+        const key = try json.Stringify.valueAlloc(self.a, .{
+            source,                                                  line, op.object.get("kind").?.string,
+            if (op.object.get("callee")) |name| name.string else "",
+        }, .{});
+        const previous = self.diagnostics.get(key);
+        var instances = if (previous) |p| p.object.get("instances").? else json.Value{ .array = std.array_list.Managed(json.Value).init(self.a) };
+        var instance: json.Value = .{ .object = .{} };
+        try instance.object.put(self.a, "ir_line", .{ .integer = @intCast(ir_line) });
+        try instance.object.put(self.a, "ir_column", .{ .integer = @intCast(ir_column) });
+        try instance.object.put(self.a, "function", if (function) |f| .{ .string = f } else .null);
+        try instance.object.put(self.a, "source_column", .{ .integer = @intCast(column) });
+        if (op.object.get("bytes")) |size| try instance.object.put(self.a, "bytes", size);
+        try instances.array.append(instance);
+        try op.object.put(self.a, "instances", instances);
+        try op.object.put(self.a, "instance_count", .{ .integer = @intCast(instances.array.items.len) });
+        if (op.object.get("bytes")) |size| {
             if (previous) |p| {
                 const old = p.object.get("bytes").?;
-                const new = op.object.get("bytes").?;
-                try op.object.put(self.a, "bytes", if (old == .null or new == .null) .null else .{ .integer = @max(old.integer, new.integer) });
+                try op.object.put(self.a, "bytes", if (old == .null or size == .null) .null else .{ .integer = @max(old.integer, size.integer) });
             }
         }
         try self.diagnostics.put(key, op);
     }
 };
-pub fn analyze(a: Allocator, io: std.Io, ir_paths: []const []const u8, manifest: json.Value) !json.Value {
-    if (manifest != .object) return error.InvalidManifest;
-    var self = Analysis{ .a = a, .sources = .{ .object = .{} }, .line_counts = .init(a), .diagnostics = .init(a), .invalid = .init(a) };
-    const keys = try a.dupe([]const u8, manifest.object.keys());
-    std.mem.sort([]const u8, keys, {}, struct {
-        fn less(_: void, l: []const u8, r: []const u8) bool {
-            return std.mem.lessThan(u8, l, r);
+
+/// Summarize a single LLVM IR file. Source paths are debug metadata only:
+/// no source files are opened, checked, or hashed.
+pub fn analyze(a: Allocator, io: std.Io, ir_path: []const u8) !json.Value {
+    var analysis = Analysis{ .a = a, .diagnostics = .init(a) };
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, ir_path, a, .unlimited);
+    var debug = try DebugInfo.init(a, text);
+    var lines = Lines{ .text = text };
+    var number: usize = 0;
+    var function: ?[]const u8 = null;
+    var pending: ?[]const u8 = null;
+    var pending_function: ?[]const u8 = null;
+    var pending_line: usize = 0;
+    var pending_column: usize = 0;
+    while (lines.next()) |line| {
+        number += 1;
+        const stripped = std.mem.trim(u8, line, whitespace);
+        if (std.mem.startsWith(u8, stripped, "define ")) function = if (callee(stripped)) |sym| try unquote(a, sym.text[1..]) else null;
+        if (callBody(stripped) != null) {
+            if (pending) |p| try analysis.record(&debug, p, pending_line, pending_column, pending_function);
+            pending = stripped;
+            pending_line = number;
+            pending_column = line.len - std.mem.trimStart(u8, line, whitespace).len + 1;
+            pending_function = function;
+        } else if (pending != null and ((stripped.len > 0 and std.mem.startsWith(u8, line, "    ")) or std.mem.startsWith(u8, stripped, "to label ") or std.mem.startsWith(u8, stripped, "unwind label "))) {
+            pending = try std.fmt.allocPrint(a, "{s} {s}", .{ pending.?, stripped });
+        } else {
+            if (pending) |p| try analysis.record(&debug, p, pending_line, pending_column, pending_function);
+            pending = null;
         }
-    }.less);
-    for (keys) |source| {
-        if (!validSource(source)) return error.SourceMustBeWorkspaceRelative;
-        const path = manifest.object.get(source).?;
-        if (path != .string) return error.InvalidManifest;
-        const text = try cleanSource(a, try std.Io.Dir.cwd().readFileAlloc(io, path.string, a, .unlimited));
-        try self.sources.object.put(a, source, .{ .string = try digest(a, text) });
-        var lines = Lines{ .text = text };
-        var count: usize = 0;
-        while (lines.next() != null) count += 1;
-        try self.line_counts.put(source, count);
+        if (pending) |p| if (std.mem.indexOf(u8, p, "!dbg !") != null) {
+            try analysis.record(&debug, p, pending_line, pending_column, pending_function);
+            pending = null;
+        };
     }
-    for (ir_paths) |path| {
-        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
-        var debug = try DebugInfo.init(a, text, self.sources);
-        var lines = Lines{ .text = text };
-        var number: usize = 0;
-        var function: ?[]const u8 = null;
-        var pending: ?[]const u8 = null;
-        var pending_function: ?[]const u8 = null;
-        var pending_line: usize = 0;
-        while (lines.next()) |line| {
-            number += 1;
-            const stripped = std.mem.trim(u8, line, whitespace);
-            if (std.mem.startsWith(u8, stripped, "define ")) function = if (callee(stripped)) |sym| try unquote(a, sym.text[1..]) else null;
-            if (callBody(stripped) != null) {
-                if (pending) |p| try self.record(&debug, p, path, pending_line, pending_function);
-                pending = stripped;
-                pending_line = number;
-                pending_function = function;
-            } else if (pending != null and ((stripped.len > 0 and std.mem.startsWith(u8, line, "    ")) or std.mem.startsWith(u8, stripped, "to label ") or std.mem.startsWith(u8, stripped, "unwind label "))) {
-                pending = try std.fmt.allocPrint(a, "{s} {s}", .{ pending.?, stripped });
-            } else {
-                if (pending) |p| try self.record(&debug, p, path, pending_line, pending_function);
-                pending = null;
-            }
-            if (pending) |p| if (std.mem.indexOf(u8, p, "!dbg !") != null) {
-                try self.record(&debug, p, path, pending_line, pending_function);
-                pending = null;
-            };
-        }
-        if (pending) |p| try self.record(&debug, p, path, pending_line, pending_function);
-    }
-    var report = json.Value{ .object = .{} };
-    try report.object.put(a, "version", .{ .integer = 1 });
-    try report.object.put(a, "sources", self.sources);
+    if (pending) |p| try analysis.record(&debug, p, pending_line, pending_column, pending_function);
+    var report: json.Value = .{ .object = .{} };
+    try report.object.put(a, "version", .{ .integer = 2 });
+    try report.object.put(a, "ir", .{ .string = ir_path });
     var diagnostics = json.Value{ .array = std.array_list.Managed(json.Value).init(a) };
-    var it = self.diagnostics.valueIterator();
+    var it = analysis.diagnostics.valueIterator();
     while (it.next()) |value| try diagnostics.array.append(value.*);
     std.mem.sort(json.Value, diagnostics.array.items, {}, diagnosticLess);
     try report.object.put(a, "diagnostics", diagnostics);
-    var invalid = json.Value{ .array = std.array_list.Managed(json.Value).init(a) };
-    var invalid_it = self.invalid.valueIterator();
-    while (invalid_it.next()) |value| try invalid.array.append(value.*);
-    std.mem.sort(json.Value, invalid.array.items, {}, diagnosticLess);
-    try report.object.put(a, "invalid_debug_locations", invalid);
-    var unmapped = json.Value{ .object = .{} };
-    try unmapped.object.put(a, "calls_without_debug_location", .{ .integer = @intCast(self.no_debug) });
-    try unmapped.object.put(a, "calls_outside_sources", .{ .integer = @intCast(self.outside) });
+    var unmapped: json.Value = .{ .object = .{} };
+    try unmapped.object.put(a, "calls_without_debug_location", .{ .integer = @intCast(analysis.no_debug) });
+    try unmapped.object.put(a, "calls_with_unresolved_debug_location", .{ .integer = @intCast(analysis.unresolved_debug) });
     try report.object.put(a, "unmapped", unmapped);
     return report;
 }

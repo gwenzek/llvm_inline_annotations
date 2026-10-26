@@ -1,63 +1,90 @@
 # LLVM inline annotations
 
-The native analyzer is written for **Zig 0.17.0**. It generates the same version-1
-JSON reports and supports the same `analyze` and `apply` commands as `analyzer.py`.
-Python is retained as a compatibility reference and for the existing Bazel rules;
-the Zig executable has no Python dependency.
+The Zig 0.17.0 analyzer summarizes **one optimized LLVM IR file**. Analysis reads
+only that `.ll` file: no source manifests, source reads, hashes, line-count checks,
+or dependency-file output.
 
 ```sh
 zig build
-zig build run -- analyze --ir program.ll --manifest sources.json --output report.json
-zig build run -- apply --report report.json --workspace "$PWD" --prefix src --check
+zig build run -- analyze --ir program.ll --output analysis.json
 zig build test test-integration
-zig build example-report  # writes zig-out/analysis.json
+zig build example-report
+zig build self-report
 ```
 
-`test-integration` requires Python 3 and compares the reports against the Python
-implementation, then tests annotation, removal, stale-source rejection, and path
-containment through the Zig CLI. `test` runs native Zig unit tests.
+Version-2 reports keep the LLVM IR path once, in the top-level `ir` field.
+Diagnostics group surviving calls and memory operations by debug source path,
+source line, operation kind, and callee. Each occurrence has an `instances` entry
+with a one-based `ir_line` and `ir_column` pointing to the start of the instruction
+in that file. Multiline instructions point to their first line. Columns are byte
+offsets, so a tab counts as one byte. No instruction text is copied into JSON.
 
-A manifest maps workspace-relative names to readable source paths, for example
-`{"src/main.zig": "/checkout/src/main.zig"}`. Alternatively, pass repeated
-`--source src/main.zig /checkout/src/main.zig` pairs. Multiple `--ir` inputs merge
-into one report. Source paths passed this way may be generated build outputs.
+```json
+{
+  "version": 2,
+  "ir": "/build/program.ll",
+  "diagnostics": [{
+    "path": "src/main.zig",
+    "line": 42,
+    "kind": "memcpy",
+    "bytes": 256,
+    "instance_count": 1,
+    "instances": [{
+      "ir_line": 120,
+      "ir_column": 3,
+      "source_column": 9,
+      "function": "main.work",
+      "bytes": 256
+    }]
+  }],
+  "unmapped": {
+    "calls_without_debug_location": 0,
+    "calls_with_unresolved_debug_location": 0
+  }
+}
+```
+
+Memory operations retain their maximum constant size; any dynamic size makes the
+merged `bytes` null. Instances preserve individual sizes. Calls also retain every
+IR occurrence. Operations without usable debug metadata remain in the report
+with an empty source path and/or line zero and contribute to the `unmapped`
+counts. Source locations are lexical debug locations, not the outer `inlinedAt`
+call site. Non-memory LLVM intrinsics, inline assembly, and generated
+`debug.FullPanic(...)` calls remain excluded.
+
+Debug paths come from the `DIFile` filename and directory without normalization
+or filtering. Missing, external, and generated sources remain in the report.
+Keep the `.ll` file alongside the report if you need to inspect the referenced
+instructions; moving it requires updating the top-level `ir` path.
 
 ## Zig build integration
 
-Add this package as a dependency named `llvm_inline_annotations` in your
-`build.zig.zon`. After creating your executable in `build.zig`:
+Add this package as a dependency named `llvm_inline_annotations`, then:
 
 ```zig
 const annotations = @import("llvm_inline_annotations");
 
 // Inside build(b), after defining exe:
 const dep = b.dependency("llvm_inline_annotations", .{});
-const report = annotations.addAnalysis(dep.builder, exe, .{
-    .sources = &.{
-        .{ .name = "src/main.zig", .path = b.path("src/main.zig") },
-        .{ .name = "src/model.zig", .path = b.path("src/model.zig") },
-    },
-    .output_name = "program-analysis.json", // optional; default: analysis.json
-});
-const install_report = b.addInstallFile(report, "program-analysis.json");
-b.step("analyze", "Analyze the executable's optimized LLVM IR")
-    .dependOn(&install_report.step);
+const report = annotations.addAnalysis(dep.builder, exe);
+b.step("analyze", "Summarize optimized LLVM IR")
+    .dependOn(&b.addInstallFile(report, "analysis.json").step);
 ```
 
-`addAnalysis(b, exe, options)` returns a `std.Build.LazyPath` that can be installed
-or passed to another build step. Pass the **dependency's builder** as its first
-argument so it can locate `analyzer.zig`. When calling from this package itself,
-pass `b`. Source names must be workspace-relative; supply every source you want
-included in the report. Calls outside that set are counted as unmapped.
+The helper returns a `std.Build.LazyPath` for `analysis.json`. Its only analysis
+input is `exe.getEmittedLlvmIr()`. There are no analysis options.
 
-The helper enables LLVM and debug information on the supplied executable and its
-module graph, upgrading Debug or unspecified optimization to ReleaseSafe. Other
-release modes are preserved. These settings also affect any other artifacts that
-share those modules. Call it after configuring imports. The analyzer runs on the
-host even if `exe` targets another platform; the executable itself is never run.
-Source files and emitted LLVM IR are build inputs, so changes invalidate the
-cached report. Report generation does not annotate source files; use `apply`
-explicitly for that.
+The helper enables LLVM and debug information and upgrades Debug or unspecified
+module optimization to ReleaseSafe. Other release modes are preserved. Shared
+modules inherit these settings. The analyzer runs on the host for cross builds.
+
+`zig build test` runs native tests. `zig build test-integration` requires Python 3
+and verifies the IR-only schema, references, aggregation, missing source files,
+and rejected multiple-input/source/dependency options.
+
+The retained `apply` command supports legacy version-1 reports with source hashes;
+it does not accept the new version-2 summaries. The Python/Bazel workflow below
+continues to produce and apply version-1 reports independently.
 
 ## Existing Bazel workflow
 
