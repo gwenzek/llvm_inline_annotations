@@ -52,15 +52,22 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run the analyzer CLI").dependOn(&run.step);
 
-    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("analyzer.zig"), .target = b.graph.host, .optimize = optimize }) });
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("analyzer.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
     b.step("test", "Run analyzer tests").dependOn(&b.addRunArtifact(tests).step);
 
     {
-        const report = addAnalysis(b, exe);
+        const opt_exe = analyzer(b, target, .safe);
+        const report = addAnalysis(b, opt_exe);
         const install_report = b.addInstallFile(report, "analysis.json");
         b.step("self-report", "Generates self report").dependOn(&install_report.step);
 
-        const annotate = addAnnotations(b, report, exe.step.owner.path("."));
+        const annotate = addAnnotations(b, report, opt_exe.step.owner.path("."));
         b.step("self-annotate", "Annotate our codebase").dependOn(&annotate.step);
     }
 

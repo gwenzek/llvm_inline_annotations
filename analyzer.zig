@@ -86,9 +86,14 @@ pub fn main(init: std.process.Init) !void {
             var reader = file.reader(io, &buffer); // llvm-ir: memcpy (40 bytes)
             var tokens = json.Reader.init(a, &reader.interface);
             defer tokens.deinit(); // llvm-ir: not inlined: "json.Scanner.Reader.deinit"
-            break :report try json.parseFromTokenSourceLeaky(json.Value, a, &tokens, .{ // llvm-ir: memcpy (56 bytes); not inlined: "json.static.parseFromTokenSourceLeaky__func_45"
-                .max_value_len = std.math.maxInt(usize),
-            });
+            break :report try json.parseFromTokenSourceLeaky( // llvm-ir: memcpy (56 bytes); not inlined: "json.static.parseFromTokenSourceLeaky__func_46"
+                json.Value,
+                a,
+                &tokens,
+                .{
+                    .max_value_len = std.math.maxInt(usize),
+                },
+            );
         };
         const result = try apply(a, io, report, workspace, clean); // llvm-ir: not inlined: "analyzer.apply"
         try stdout.interface.print("Updated {d} files; skipped {d} locations\n", .{ result.count, result.skipped.len });
@@ -100,8 +105,8 @@ pub fn main(init: std.process.Init) !void {
 /// Source paths are debug metadata only:
 /// no source files are opened, checked, or hashed.
 pub fn analyze(a: Allocator, reader: *std.Io.Reader, ir_path: []const u8) !json.Value {
-    var analysis: Analysis = .{ .a = a, .diagnostics = .init(a) }; // llvm-ir: memcpy (max 40 bytes); memset (16 bytes)
-    var debug: DebugInfo = .{ .a = a, .nodes = .init(a), .cache = .init(a) }; // llvm-ir: memcpy (max 40 bytes)
+    var analysis: Analysis = .{ .a = a, .diagnostics = .init(a) }; // llvm-ir: memcpy (56 bytes); memset (16 bytes)
+    var debug: DebugInfo = .{ .a = a, .nodes = .init(a), .cache = .init(a) }; // llvm-ir: memcpy (96 bytes)
     // Debug metadata usually follows instructions, so resolve calls after EOF.
     const Call = struct { text: []const u8, line: usize, column: usize, function: ?[]const u8 };
     var calls: std.ArrayList(Call) = .empty; // llvm-ir: memcpy (32 bytes)
@@ -134,8 +139,11 @@ pub fn analyze(a: Allocator, reader: *std.Io.Reader, ir_path: []const u8) !json.
             else
                 null;
         }
+        try calls.ensureUnusedCapacity(a, 1);
         if (callBody(stripped) != null) { // llvm-ir: not inlined: "analyzer.callBody"
-            if (pending) |p| try calls.append(a, .{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function }); // llvm-ir: not inlined: "array_list.Aligned(analyzer.analyze.Call,null).append"
+            if (pending) |p| {
+                calls.appendAssumeCapacity(.{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function });
+            }
             pending = try a.dupe(u8, stripped);
             pending_line = number;
             pending_column = line.len - std.mem.trimStart(u8, line, whitespace).len + 1;
@@ -143,15 +151,19 @@ pub fn analyze(a: Allocator, reader: *std.Io.Reader, ir_path: []const u8) !json.
         } else if (pending != null and ((stripped.len > 0 and std.mem.startsWith(u8, line, "    ")) or std.mem.startsWith(u8, stripped, "to label ") or std.mem.startsWith(u8, stripped, "unwind label "))) {
             pending = try std.fmt.allocPrint(a, "{s} {s}", .{ pending.?, stripped });
         } else {
-            if (pending) |p| try calls.append(a, .{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function }); // llvm-ir: not inlined: "array_list.Aligned(analyzer.analyze.Call,null).append"
+            if (pending) |p| {
+                calls.appendAssumeCapacity(.{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function });
+            }
             pending = null;
         }
         if (pending) |p| if (std.mem.indexOf(u8, p, "!dbg !") != null) { // llvm-ir: not inlined: "mem.find__func_25"
-            try calls.append(a, .{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function }); // llvm-ir: not inlined: "array_list.Aligned(analyzer.analyze.Call,null).append"
+            calls.appendAssumeCapacity(.{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function });
             pending = null;
         };
     }
-    if (pending) |p| try calls.append(a, .{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function }); // llvm-ir: not inlined: "array_list.Aligned(analyzer.analyze.Call,null).append"
+    if (pending) |p| {
+        try calls.append(a, .{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function });
+    }
     if (debug.units == 0) return error.ExpectedOptimizedDICompileUnit; // llvm-ir: memcpy (64 bytes)
     for (calls.items) |call| try analysis.record(&debug, call.text, call.line, call.column, call.function);
     var report: json.Value = .{ .object = .{} }; // llvm-ir: memset (40 bytes)
@@ -160,7 +172,10 @@ pub fn analyze(a: Allocator, reader: *std.Io.Reader, ir_path: []const u8) !json.
 
     var diagnostics: json.Value = .{ .array = .init(a) };
     var it = analysis.diagnostics.valueIterator();
-    while (it.next()) |value| try diagnostics.array.append(value.*); // llvm-ir: memcpy (56 bytes)
+    while (it.next()) |value| {
+        try summarizeMemory(a, value);
+        try diagnostics.array.append(value.*); // llvm-ir: memcpy (56 bytes)
+    }
     std.mem.sort(json.Value, diagnostics.array.items, {}, diagnosticLess);
     try report.object.put(a, "diagnostics", diagnostics);
     var unmapped: json.Value = .{ .object = .{} }; // llvm-ir: memset (40 bytes)
@@ -205,7 +220,7 @@ pub fn splitFields(a: Allocator, text: []const u8) ![][]const u8 {
 
 fn unquote(a: Allocator, raw: []const u8) ![]const u8 {
     const text = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') raw[1 .. raw.len - 1] else raw;
-    var result: std.ArrayList(u8) = .empty; // llvm-ir: memcpy (max 32 bytes)
+    var result: std.ArrayList(u8) = .empty; // llvm-ir: memcpy (64 bytes)
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
         if (text[i] == '\\' and i + 2 < text.len) {
@@ -268,7 +283,7 @@ const Lines = struct {
     fn next(self: *Lines) ?[]const u8 {
         if (self.pos == self.text.len) return null;
         const start = self.pos;
-        self.pos = if (std.mem.indexOfScalarPos(u8, self.text, start, '\n')) |n| n + 1 else self.text.len; // llvm-ir: not inlined: "mem.findScalarPos__func_161"
+        self.pos = if (std.mem.indexOfScalarPos(u8, self.text, start, '\n')) |n| n + 1 else self.text.len; // llvm-ir: not inlined: "mem.findScalarPos__func_162"
         return self.text[start..self.pos];
     }
 };
@@ -295,7 +310,7 @@ const DebugInfo = struct {
         if (std.mem.startsWith(u8, body, "distinct ")) body = body[9..];
         if (!std.mem.startsWith(u8, body, "!") or !std.mem.endsWith(u8, body, ")")) return;
         const open = std.mem.indexOfScalar(u8, body, '(') orelse return;
-        var node = Node{ .kind = body[1..open], .fields = .init(self.a) }; // llvm-ir: memcpy (max 40 bytes)
+        var node: Node = .{ .kind = body[1..open], .fields = .init(self.a) }; // llvm-ir: memcpy (56 bytes)
         for (try splitFields(self.a, body[open + 1 .. body.len - 1])) |field| { // llvm-ir: not inlined: "analyzer.splitFields"
             if (std.mem.indexOf(u8, field, ": ")) |colon| try node.fields.put(field[0..colon], field[colon + 2 ..]);
         }
@@ -308,11 +323,11 @@ const DebugInfo = struct {
     fn sourceFile(self: *DebugInfo, ref: []const u8, depth: usize) !?[]const u8 {
         if (self.cache.get(ref)) |cached| return cached; // llvm-ir: memcpy (16 bytes)
         if (depth > self.nodes.count()) return null; // llvm-ir: memset (24 bytes)
-        const node = self.nodes.get(ref) orelse return null; // llvm-ir: memcpy (max 16 bytes); memset (24 bytes)
+        const node = self.nodes.get(ref) orelse return null; // llvm-ir: memcpy (32 bytes); memset (24 bytes)
         var result: ?[]const u8 = null;
         if (std.mem.eql(u8, node.kind, "DIFile")) {
-            const filename = try unquote(self.a, node.fields.get("filename") orelse ""); // llvm-ir: memcpy (max 16 bytes); not inlined: "analyzer.unquote"
-            const directory = try unquote(self.a, node.fields.get("directory") orelse ""); // llvm-ir: memcpy (max 16 bytes); not inlined: "analyzer.unquote"
+            const filename = try unquote(self.a, node.fields.get("filename") orelse ""); // llvm-ir: memcpy (32 bytes); not inlined: "analyzer.unquote"
+            const directory = try unquote(self.a, node.fields.get("directory") orelse ""); // llvm-ir: memcpy (32 bytes); not inlined: "analyzer.unquote"
             if (filename.len != 0) {
                 const path = if (std.fs.path.isAbsolutePosix(filename) or directory.len == 0)
                     filename
@@ -322,7 +337,7 @@ const DebugInfo = struct {
             }
         } else {
             result = try self.sourceFile( // llvm-ir: not inlined: "analyzer.DebugInfo.sourceFile"
-                node.fields.get("file") orelse node.fields.get("scope") orelse "", // llvm-ir: memcpy (max 16 bytes)
+                node.fields.get("file") orelse node.fields.get("scope") orelse "", // llvm-ir: memcpy (32 bytes)
                 depth + 1,
             );
         }
@@ -470,8 +485,8 @@ pub fn operation(a: Allocator, instruction: []const u8) !?json.Value {
     return op;
 }
 
-fn diagnosticLess(_: void, lhs: json.Value, rhs: json.Value) bool { // llvm-ir: memcpy (max 16 bytes)
-    const path_order = std.mem.order(u8, lhs.object.get("path").?.string, rhs.object.get("path").?.string); // llvm-ir: memcpy (max 16 bytes)
+fn diagnosticLess(_: void, lhs: json.Value, rhs: json.Value) bool { // llvm-ir: memcpy (32 bytes)
+    const path_order = std.mem.order(u8, lhs.object.get("path").?.string, rhs.object.get("path").?.string); // llvm-ir: memcpy (32 bytes)
     if (path_order != .eq) return path_order == .lt;
     const l = lhs.object.get("line").?.integer; // llvm-ir: memcpy (16 bytes)
     const r = rhs.object.get("line").?.integer; // llvm-ir: memcpy (16 bytes)
@@ -522,25 +537,48 @@ const Analysis = struct {
             if (op.object.get("callee")) |name| name.string else "", // llvm-ir: memcpy (16 bytes)
         }, .{});
         const previous = self.diagnostics.get(key); // llvm-ir: memcpy (16 bytes)
-        var instances = if (previous) |p| p.object.get("instances").? else json.Value{ .array = std.array_list.Managed(json.Value).init(self.a) }; // llvm-ir: memcpy (max 56 bytes)
+        var instances: json.Value = if (previous) |p| p.object.get("instances").? else .{ .array = .init(self.a) }; // llvm-ir: memcpy (144 bytes)
         var instance: json.Value = .{ .object = .{} }; // llvm-ir: memset (40 bytes)
         try instance.object.put(self.a, "ir_line", .{ .integer = @intCast(ir_line) });
         try instance.object.put(self.a, "ir_column", .{ .integer = @intCast(ir_column) });
         try instance.object.put(self.a, "function", if (function) |f| .{ .string = f } else .null);
         try instance.object.put(self.a, "source_column", .{ .integer = @intCast(column) });
-        if (op.object.get("bytes")) |size| try instance.object.put(self.a, "bytes", size); // llvm-ir: memcpy (max 56 bytes)
+        if (op.object.get("bytes")) |size| try instance.object.put(self.a, "bytes", size); // llvm-ir: memcpy (72 bytes)
         try instances.array.append(instance);
         try op.object.put(self.a, "instances", instances);
         try op.object.put(self.a, "instance_count", .{ .integer = @intCast(instances.array.items.len) });
-        if (op.object.get("bytes")) |size| { // llvm-ir: memcpy (16 bytes)
-            if (previous) |p| { // llvm-ir: memcpy (16 bytes)
-                const old = p.object.get("bytes").?;
-                try op.object.put(self.a, "bytes", if (old == .null or size == .null) .null else .{ .integer = @max(old.integer, size.integer) });
-            }
-        }
         try self.diagnostics.put(key, op);
     }
 };
+
+// Sum operations on a source line within each emitted function, then take the
+// maximum across functions (including separate generic instantiations).
+fn summarizeMemory(a: Allocator, diagnostic: *json.Value) !void {
+    if (!diagnostic.object.contains("bytes")) return; // llvm-ir: memcpy (40 bytes)
+    var totals = std.StringHashMap(?i64).init(a); // llvm-ir: memcpy (40 bytes)
+    defer totals.deinit(); // llvm-ir: not inlined: "hash_map.HashMap([]const u8,?i64,hash_map.StringContext,80).deinit"
+    for (diagnostic.object.get("instances").?.array.items) |instance| { // llvm-ir: memcpy (32 bytes)
+        const function = instance.object.get("function").?; // llvm-ir: memcpy (16 bytes)
+        const entry = try totals.getOrPut(if (function == .string) function.string else "");
+        if (!entry.found_existing) entry.value_ptr.* = 0; // llvm-ir: memcpy (16 bytes)
+        const size = instance.object.get("bytes").?; // llvm-ir: memcpy (16 bytes)
+        entry.value_ptr.* = if (entry.value_ptr.*) |total|
+            if (size == .integer) std.math.add(i64, total, size.integer) catch null else null // llvm-ir: memcpy (16 bytes)
+        else
+            null;
+    }
+    var maximum: i64 = 0;
+    var values = totals.valueIterator();
+    while (values.next()) |total| {
+        maximum = @max(maximum, total.* orelse {
+            try diagnostic.object.put(a, "bytes", .null);
+            break;
+        });
+    } else {
+        try diagnostic.object.put(a, "bytes", .{ .integer = maximum });
+    }
+    try diagnostic.object.put(a, "function_count", .{ .integer = @intCast(totals.count()) });
+}
 
 pub fn description(a: Allocator, diagnostic: json.Value) ![]const u8 {
     const kind = diagnostic.object.get("kind").?.string; // llvm-ir: memcpy (16 bytes)
@@ -549,7 +587,7 @@ pub fn description(a: Allocator, diagnostic: json.Value) ![]const u8 {
     if (size == .null) return std.fmt.allocPrint(a, "{s} (dynamic size)", .{kind});
     return std.fmt.allocPrint(a, "{s} ({s}{d} bytes)", .{
         kind,
-        if ((diagnostic.object.get("instance_count") orelse json.Value{ .integer = 0 }).integer > 1) "max " else "", // llvm-ir: memcpy (16 bytes)
+        if ((diagnostic.object.get("function_count") orelse (diagnostic.object.get("instance_count") orelse json.Value{ .integer = 0 })).integer > 1) "max " else "", // llvm-ir: memcpy (151 bytes); memset (57 bytes)
         size.integer,
     });
 }
@@ -558,19 +596,19 @@ pub const ApplyResult = struct { count: usize, skipped: []const []const u8 };
 
 pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8, clean: bool) !ApplyResult { // llvm-ir: memcpy (16 bytes)
     if (report != .object) return error.InvalidReport; // llvm-ir: memcpy (32 bytes)
-    const version = report.object.get("version") orelse return error.UnsupportedReportVersion; // llvm-ir: memcpy (max 32 bytes)
+    const version = report.object.get("version") orelse return error.UnsupportedReportVersion; // llvm-ir: memcpy (48 bytes)
     if (version != .integer or version.integer != 2) return error.UnsupportedReportVersion; // llvm-ir: memcpy (32 bytes)
     var sources: json.Value = .{ .object = .{} }; // llvm-ir: memset (40 bytes)
-    var diagnostics = report.object.get("diagnostics") orelse return error.InvalidReport; // llvm-ir: memcpy (max 32 bytes)
+    var diagnostics = report.object.get("diagnostics") orelse return error.InvalidReport; // llvm-ir: memcpy (48 bytes)
     if (diagnostics != .array) return error.InvalidReport; // llvm-ir: memcpy (32 bytes)
     const root = try std.Io.Dir.cwd().realPathFileAlloc(io, workspace, a);
-    const root_prefix = if (std.mem.endsWith(u8, root, "/")) root else try std.fmt.allocPrint(a, "{s}/", .{root}); // llvm-ir: not inlined: "fmt.allocPrint__func_46"
+    const root_prefix = if (std.mem.endsWith(u8, root, "/")) root else try std.fmt.allocPrint(a, "{s}/", .{root}); // llvm-ir: not inlined: "fmt.allocPrint__func_47"
     var skipped: std.ArrayList([]const u8) = .empty; // llvm-ir: memcpy (32 bytes)
     var mapped: json.Value = .{ .array = .init(a) };
     for (diagnostics.array.items) |diagnostic| { // llvm-ir: memcpy (16 bytes)
         if (diagnostic != .object) return error.InvalidReport; // llvm-ir: memcpy (32 bytes)
-        const source = diagnostic.object.get("path") orelse return error.InvalidReport; // llvm-ir: memcpy (max 32 bytes)
-        const line = diagnostic.object.get("line") orelse return error.InvalidReport; // llvm-ir: memcpy (max 32 bytes)
+        const source = diagnostic.object.get("path") orelse return error.InvalidReport; // llvm-ir: memcpy (48 bytes)
+        const line = diagnostic.object.get("line") orelse return error.InvalidReport; // llvm-ir: memcpy (48 bytes)
         if (source != .string or line != .integer) return error.InvalidReport; // llvm-ir: memcpy (32 bytes)
         if (source.string.len == 0) continue;
         const candidate = try std.fs.path.resolve(a, &.{ root, source.string });
@@ -597,7 +635,7 @@ pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8
         var entry: json.Value = .{ .object = .{} }; // llvm-ir: memset (40 bytes)
         for (
             diagnostic.object.keys(), // llvm-ir: memcpy (16 bytes); not inlined: "array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).keys"
-            diagnostic.object.values(), // llvm-ir: memcpy (max 56 bytes); not inlined: "array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).values"
+            diagnostic.object.values(), // llvm-ir: memcpy (72 bytes); not inlined: "array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).values"
         ) |key, value| {
             try entry.object.put(a, key, value);
         }
@@ -606,7 +644,7 @@ pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8
     }
     diagnostics = mapped;
     const Change = struct { path: []const u8, text: []const u8 };
-    var changes: std.ArrayList(Change) = .empty; // llvm-ir: memcpy (max 32 bytes)
+    var changes: std.ArrayList(Change) = .empty; // llvm-ir: memcpy (64 bytes)
     for (sources.object.keys()) |source| { // llvm-ir: not inlined: "array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).keys"
         if (!validSource(source)) return error.SourceEscapesWorkspace; // llvm-ir: memcpy (32 bytes); not inlined: "analyzer.validSource"
         const path = try std.Io.Dir.cwd().realPathFileAlloc(io, try std.fs.path.join(a, &.{ root, source }), a); // llvm-ir: not inlined: "Io.Dir.realPathFileAlloc"
@@ -629,8 +667,8 @@ pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8
         while (lines.next()) |line| {
             number += 1;
             var messages: std.ArrayList([]const u8) = .empty; // llvm-ir: memcpy (32 bytes)
-            if (!clean) for (diagnostics.array.items) |diagnostic| { // llvm-ir: memcpy (max 16 bytes)
-                if (!std.mem.eql(u8, diagnostic.object.get("path").?.string, source) or diagnostic.object.get("line").?.integer != number) continue; // llvm-ir: memcpy (max 16 bytes)
+            if (!clean) for (diagnostics.array.items) |diagnostic| { // llvm-ir: memcpy (32 bytes)
+                if (!std.mem.eql(u8, diagnostic.object.get("path").?.string, source) or diagnostic.object.get("line").?.integer != number) continue; // llvm-ir: memcpy (32 bytes)
                 if (std.mem.eql(u8, diagnostic.object.get("kind").?.string, "call")) { // llvm-ir: memcpy (16 bytes)
                     // Don't mark Zig panic as inlining failures, because those are never inlined and shouldn't either
                     if (std.mem.startsWith(u8, diagnostic.object.get("callee").?.string, "debug.FullPanic(") or // llvm-ir: memcpy (16 bytes)
@@ -739,7 +777,8 @@ test "IR-only summary preserves debug paths and references every instance" {
         }
         const kind = diagnostic.object.get("kind").?.string;
         if (std.mem.eql(u8, kind, "memcpy")) {
-            try std.testing.expectEqual(@as(i64, 256), diagnostic.object.get("bytes").?.integer);
+            try std.testing.expectEqual(@as(i64, 264), diagnostic.object.get("bytes").?.integer);
+            try std.testing.expectEqualStrings("memcpy (264 bytes)", try description(a, diagnostic));
             try std.testing.expectEqual(@as(i64, 1904), diagnostic.object.get("line").?.integer);
             const copies = diagnostic.object.get("instances").?.array.items;
             try std.testing.expectEqual(@as(usize, 2), copies.len);
@@ -758,6 +797,41 @@ test "IR-only summary preserves debug paths and references every instance" {
     const unmapped = report.object.get("unmapped").?.object;
     try std.testing.expectEqual(@as(i64, 1), unmapped.get("calls_without_debug_location").?.integer);
     try std.testing.expectEqual(@as(i64, 1), unmapped.get("calls_with_unresolved_debug_location").?.integer);
+}
+
+test "memory bytes sum per generated function before taking the maximum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input =
+        \\define void @generic.small() {
+        \\  call void @memcpy(ptr %a, ptr %b, i64 8), !dbg !3
+        \\  call void @memcpy(ptr %a, ptr %b, i64 24), !dbg !4
+        \\  call void @memset(ptr %a, i8 0, i64 10), !dbg !3
+        \\  call void @memset(ptr %a, i8 0, i64 20), !dbg !4
+        \\}
+        \\define void @generic.large() {
+        \\  call void @memcpy(ptr %a, ptr %b, i64 20), !dbg !3
+        \\  call void @memcpy(ptr %a, ptr %b, i64 20), !dbg !4
+        \\  call void @memset(ptr %a, i8 0, i64 25), !dbg !3
+        \\  call void @memcpy(ptr %a, ptr %b, i64 100), !dbg !5
+        \\}
+        \\!0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !1, isOptimized: true)
+        \\!1 = !DIFile(filename: "source.zig", directory: "/workspace")
+        \\!2 = distinct !DISubprogram(name: "generic", file: !1, line: 1)
+        \\!3 = !DILocation(line: 2, column: 1, scope: !2)
+        \\!4 = !DILocation(line: 2, column: 9, scope: !2)
+        \\!5 = !DILocation(line: 3, column: 1, scope: !2)
+    ;
+    var reader = std.Io.Reader.fixed(input);
+    const report = try analyze(a, &reader, "input.ll");
+    const diagnostics = report.object.get("diagnostics").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.len);
+    try std.testing.expectEqualStrings("memcpy (max 40 bytes)", try description(a, diagnostics[0]));
+    try std.testing.expectEqual(@as(i64, 4), diagnostics[0].object.get("instance_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), diagnostics[0].object.get("function_count").?.integer);
+    try std.testing.expectEqualStrings("memset (max 30 bytes)", try description(a, diagnostics[1]));
+    try std.testing.expectEqualStrings("memcpy (100 bytes)", try description(a, diagnostics[2]));
 }
 
 test "JSON serialization preserves Unicode and escapes quotes" {

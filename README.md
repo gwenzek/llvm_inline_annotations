@@ -8,15 +8,18 @@ Following annotations are emitted:
 - *memset*: memset emitted by Zig, but not removed by LLVM optimization passes
 - *not inlined*: function call that aren't inlined
 
+Memory byte counts sum all operations of the same kind on a given source line,
+within each generated function.
+For generic functions, the maximum value is reported across all instantiations.
+
 Apply annotations directly from optimized LLVM IR:
 
 ```sh
 llvm-inline-annotations apply --ir input.ll
 ```
 
-The analysis report stays in memory. Alternatively, use `--report analysis.json`
+Alternatively, use `--report analysis.json`
 to apply a saved report. Specify exactly one of `--ir` or `--report`.
-Add `--clean` to remove existing annotations from the files referenced by the analysis.
 
 ## Zig build integration
 
@@ -33,7 +36,7 @@ b.step("analyze", "Summarize optimized LLVM IR")
 ```
 
 The helper returns a `std.Build.LazyPath` for `analysis.json`. Its only analysis
-input is `exe.getEmittedLlvmIr()`. There are no analysis options.
+input is `exe.getEmittedLlvmIr()`.
 
 The helper enables LLVM and debug information and upgrades Debug or unspecified
 module optimization to ReleaseSafe. Other release modes are preserved. 
