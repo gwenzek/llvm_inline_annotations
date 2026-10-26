@@ -53,11 +53,4 @@ pub fn build(b: *std.Build) void {
         const install_report = b.addInstallFile(report, "analysis.json");
         b.step("example-report", "Generates an example report").dependOn(&install_report.step);
     }
-
-    {
-        const parity = b.addSystemCommand(&.{"python3"});
-        parity.addFileArg(b.path("zig_integration_test.py"));
-        parity.addArtifactArg(analyzer(b, b.graph.host, .safe));
-        b.step("test-integration", "Test the IR-only report format (requires Python 3)").dependOn(&parity.step);
-    }
 }

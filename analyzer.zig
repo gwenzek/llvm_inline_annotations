@@ -120,10 +120,7 @@ fn unquote(a: Allocator, raw: []const u8) ![]const u8 {
     while (i < text.len) : (i += 1) {
         if (text[i] == '\\' and i + 2 < text.len) {
             if (std.fmt.parseInt(u8, text[i + 1 ..][0..2], 16)) |byte| {
-                // Python's chr maps escaped bytes to Unicode code points.
-                var utf8: [4]u8 = undefined;
-                const len = try std.unicode.utf8Encode(byte, &utf8);
-                try result.appendSlice(a, utf8[0..len]);
+                try result.append(a, byte);
                 i += 2;
                 continue;
             } else |_| {}
@@ -476,31 +473,9 @@ pub fn analyze(a: Allocator, io: std.Io, ir_path: []const u8) !json.Value {
     try report.object.put(a, "unmapped", unmapped);
     return report;
 }
-// Emit ASCII JSON string escapes, matching the Python annotator even for Unicode symbols.
-fn asciiJson(a: Allocator, text: []const u8) ![]const u8 {
-    const encoded = try json.Stringify.valueAlloc(a, text, .{});
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < encoded.len) {
-        if (encoded[i] < 128) {
-            try out.append(a, encoded[i]);
-            i += 1;
-            continue;
-        }
-        const len = try std.unicode.utf8ByteSequenceLength(encoded[i]);
-        const cp = try std.unicode.utf8Decode(encoded[i..][0..len]);
-        if (cp <= 0xffff) {
-            try out.appendSlice(a, try std.fmt.allocPrint(a, "\\u{x:0>4}", .{cp}));
-        } else {
-            try out.appendSlice(a, try std.fmt.allocPrint(a, "\\u{x:0>4}\\u{x:0>4}", .{ 0xd800 + ((cp - 0x10000) >> 10), 0xdc00 + ((cp - 0x10000) & 0x3ff) }));
-        }
-        i += len;
-    }
-    return out.toOwnedSlice(a);
-}
 pub fn description(a: Allocator, diagnostic: json.Value) ![]const u8 {
     const kind = diagnostic.object.get("kind").?.string;
-    if (std.mem.eql(u8, kind, "call")) return std.fmt.allocPrint(a, "not inlined: {s}", .{try asciiJson(a, diagnostic.object.get("callee").?.string)});
+    if (std.mem.eql(u8, kind, "call")) return std.fmt.allocPrint(a, "not inlined: {s}", .{try json.Stringify.valueAlloc(a, diagnostic.object.get("callee").?.string, .{})});
     const size = diagnostic.object.get("bytes").?;
     if (size == .null) return std.fmt.allocPrint(a, "{s} (dynamic size)", .{kind});
     return std.fmt.allocPrint(a, "{s} ({s}{d} bytes)", .{ kind, if ((diagnostic.object.get("instance_count") orelse json.Value{ .integer = 0 }).integer > 1) "max " else "", size.integer });
@@ -606,4 +581,70 @@ test "annotation cleaning preserves literals and line endings" {
     try std.testing.expectEqualStrings("work(); // original\r\n", try cleanSource(a, "work(); // original // llvm-ir: foo\r\n"));
     const multiline = "    \\\\text // llvm-ir: string data\n";
     try std.testing.expectEqualStrings(multiline, try cleanSource(a, multiline));
+}
+
+test "IR-only summary preserves debug paths and references every instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.ll", .data = @embedFile("test/report.ll") });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "input.ll", a);
+    const report = try analyze(a, std.testing.io, path);
+    try std.testing.expectEqual(@as(i64, 2), report.object.get("version").?.integer);
+    try std.testing.expectEqualStrings(path, report.object.get("ir").?.string);
+    try std.testing.expect(!report.object.contains("sources"));
+    try std.testing.expect(!report.object.contains("invalid_debug_locations"));
+    const diagnostics = report.object.get("diagnostics").?.array.items;
+    try std.testing.expectEqual(@as(usize, 6), diagnostics.len);
+    var instances: usize = 0;
+    for (diagnostics) |diagnostic| {
+        const source = diagnostic.object.get("path").?.string;
+        if (source.len != 0) try std.testing.expectEqualStrings("/nonexistent/workspace/src/../missing.zig", source);
+        for (diagnostic.object.get("instances").?.array.items) |instance| {
+            instances += 1;
+            try std.testing.expect(!instance.object.contains("instruction"));
+            try std.testing.expect(!instance.object.contains("ir"));
+            try std.testing.expectEqual(@as(i64, 3), instance.object.get("ir_column").?.integer);
+            try std.testing.expect(instance.object.get("ir_line").?.integer >= 2);
+        }
+        const kind = diagnostic.object.get("kind").?.string;
+        if (std.mem.eql(u8, kind, "memcpy")) {
+            try std.testing.expectEqual(@as(i64, 256), diagnostic.object.get("bytes").?.integer);
+            try std.testing.expectEqual(@as(i64, 1904), diagnostic.object.get("line").?.integer);
+            const copies = diagnostic.object.get("instances").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), copies.len);
+            try std.testing.expectEqual(@as(i64, 2), copies[0].object.get("ir_line").?.integer);
+            try std.testing.expectEqual(@as(i64, 7), copies[0].object.get("source_column").?.integer);
+            try std.testing.expectEqual(@as(i64, 8), copies[0].object.get("bytes").?.integer);
+        } else if (std.mem.eql(u8, kind, "memset")) {
+            try std.testing.expect(diagnostic.object.get("bytes").? == .null);
+        } else if (std.mem.eql(u8, diagnostic.object.get("callee").?.string, "foo")) {
+            try std.testing.expectEqual(@as(i64, 2), diagnostic.object.get("instance_count").?.integer);
+        } else if (std.mem.eql(u8, diagnostic.object.get("callee").?.string, "other")) {
+            try std.testing.expectEqual(@as(i64, 8), diagnostic.object.get("instances").?.array.items[0].object.get("ir_line").?.integer);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 9), instances);
+    const unmapped = report.object.get("unmapped").?.object;
+    try std.testing.expectEqual(@as(i64, 1), unmapped.get("calls_without_debug_location").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), unmapped.get("calls_with_unresolved_debug_location").?.integer);
+}
+
+test "JSON serialization preserves Unicode and escapes quotes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const op = (try operation(a, "call void @\"caf\\C3\\A9\\22\"()")).?;
+    try std.testing.expectEqualStrings("café\"", op.object.get("callee").?.string);
+    try std.testing.expectEqualStrings("not inlined: \"café\\\"\"", try description(a, op));
+}
+
+test "unoptimized or stripped metadata is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.ExpectedOptimizedDICompileUnit, DebugInfo.init(a, ""));
+    try std.testing.expectError(error.ExpectedOptimizedDICompileUnit, DebugInfo.init(a, "!0 = !DICompileUnit(isOptimized: false)"));
 }
