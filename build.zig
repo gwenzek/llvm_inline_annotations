@@ -42,9 +42,11 @@ fn analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
         .root_module = b.createModule(.{ .root_source_file = b.path("analyzer.zig"), .target = target, .optimize = optimize }),
     });
 }
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
     const exe = analyzer(b, target, optimize);
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
