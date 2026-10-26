@@ -1,6 +1,6 @@
 const usage =
     \\Usage: llvm-inline-annotations analyze --ir FILE --output FILE
-    \\       llvm-inline-annotations apply (--report FILE | --ir FILE) --workspace DIR [--clean]
+    \\       llvm-inline-annotations apply (--report FILE | --ir FILE) --workspace DIR
     \\
 ;
 
@@ -28,17 +28,12 @@ pub fn main(init: std.process.Init) !void {
     var output: ?[]const u8 = null;
     var report_path: ?[]const u8 = null;
     var workspace: []const u8 = ".";
-    var clean = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try stdout.interface.writeAll(usage);
             return;
-        }
-        if (!analyzing and std.mem.eql(u8, arg, "--clean")) {
-            clean = true;
-            continue;
         }
         i += 1;
         if (i >= args.len) return error.InvalidArguments;
@@ -54,12 +49,13 @@ pub fn main(init: std.process.Init) !void {
             workspace = value;
         } else return error.InvalidArguments;
     }
+
+    var input_buffer: [4096]u8 = undefined; // llvm-ir: memset (4096 bytes)
     if (analyzing) {
         const ir_path = try std.Io.Dir.cwd().realPathFileAlloc(io, ir orelse return error.InvalidArguments, a);
         if (output == null) return error.InvalidArguments;
         const input = try std.Io.Dir.cwd().openFile(io, ir_path, .{});
         defer input.close(io);
-        var input_buffer: [4096]u8 = undefined; // llvm-ir: memset (4096 bytes)
         var reader = input.reader(io, &input_buffer); // llvm-ir: memcpy (40 bytes)
         const report = try analyze(a, &reader.interface, ir_path); // llvm-ir: not inlined: "analyzer.analyze"
         const file = try std.Io.Dir.cwd().createFile(io, output.?, .{});
@@ -76,14 +72,12 @@ pub fn main(init: std.process.Init) !void {
             const ir_path = try std.Io.Dir.cwd().realPathFileAlloc(io, path, a); // llvm-ir: not inlined: "Io.Dir.realPathFileAlloc"
             const input = try std.Io.Dir.cwd().openFile(io, ir_path, .{});
             defer input.close(io);
-            var buffer: [4096]u8 = undefined; // llvm-ir: memset (4096 bytes)
-            var reader = input.reader(io, &buffer); // llvm-ir: memcpy (40 bytes)
+            var reader = input.reader(io, &input_buffer); // llvm-ir: memcpy (40 bytes)
             break :report try analyze(a, &reader.interface, ir_path); // llvm-ir: memcpy (56 bytes); not inlined: "analyzer.analyze"
         } else report: {
             const file = try std.Io.Dir.cwd().openFile(io, report_path.?, .{});
             defer file.close(io);
-            var buffer: [4096]u8 = undefined; // llvm-ir: memset (4096 bytes)
-            var reader = file.reader(io, &buffer); // llvm-ir: memcpy (40 bytes)
+            var reader = file.reader(io, &input_buffer); // llvm-ir: memcpy (40 bytes)
             var tokens = json.Reader.init(a, &reader.interface);
             defer tokens.deinit(); // llvm-ir: not inlined: "json.Scanner.Reader.deinit"
             break :report try json.parseFromTokenSourceLeaky( // llvm-ir: memcpy (56 bytes); not inlined: "json.static.parseFromTokenSourceLeaky__func_46"
@@ -95,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
                 },
             );
         };
-        const result = try apply(a, io, report, workspace, clean); // llvm-ir: not inlined: "analyzer.apply"
+        const result = try apply(a, io, report, workspace); // llvm-ir: not inlined: "analyzer.apply"
         try stdout.interface.print("Updated {d} files; skipped {d} locations\n", .{ result.count, result.skipped.len });
         for (result.skipped) |location| std.debug.print("Report-only diagnostic: {s}\n", .{location});
     }
@@ -139,7 +133,7 @@ pub fn analyze(a: Allocator, reader: *std.Io.Reader, ir_path: []const u8) !json.
             else
                 null;
         }
-        try calls.ensureUnusedCapacity(a, 1);
+        try calls.ensureUnusedCapacity(a, 2);
         if (callBody(stripped) != null) { // llvm-ir: not inlined: "analyzer.callBody"
             if (pending) |p| {
                 calls.appendAssumeCapacity(.{ .text = p, .line = pending_line, .column = pending_column, .function = pending_function });
@@ -537,7 +531,7 @@ const Analysis = struct {
             if (op.object.get("callee")) |name| name.string else "", // llvm-ir: memcpy (16 bytes)
         }, .{});
         const previous = self.diagnostics.get(key); // llvm-ir: memcpy (16 bytes)
-        var instances: json.Value = if (previous) |p| p.object.get("instances").? else .{ .array = .init(self.a) }; // llvm-ir: memcpy (144 bytes)
+        var instances: json.Value = if (previous) |p| p.object.get("instances").? else .{ .array = .init(self.a) }; // llvm-ir: memcpy (88 bytes)
         var instance: json.Value = .{ .object = .{} }; // llvm-ir: memset (40 bytes)
         try instance.object.put(self.a, "ir_line", .{ .integer = @intCast(ir_line) });
         try instance.object.put(self.a, "ir_column", .{ .integer = @intCast(ir_column) });
@@ -594,7 +588,7 @@ pub fn description(a: Allocator, diagnostic: json.Value) ![]const u8 {
 
 pub const ApplyResult = struct { count: usize, skipped: []const []const u8 };
 
-pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8, clean: bool) !ApplyResult { // llvm-ir: memcpy (16 bytes)
+pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8) !ApplyResult { // llvm-ir: memcpy (16 bytes)
     if (report != .object) return error.InvalidReport; // llvm-ir: memcpy (32 bytes)
     const version = report.object.get("version") orelse return error.UnsupportedReportVersion; // llvm-ir: memcpy (48 bytes)
     if (version != .integer or version.integer != 2) return error.UnsupportedReportVersion; // llvm-ir: memcpy (32 bytes)
@@ -651,15 +645,13 @@ pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8
         if (!std.mem.startsWith(u8, path, root_prefix)) return error.SourceEscapesWorkspace; // llvm-ir: memcpy (32 bytes)
         const original = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited); // llvm-ir: not inlined: "Io.Dir.readFileAlloc"
         const cleaned = try cleanSource(a, original); // llvm-ir: not inlined: "analyzer.cleanSource"
-        if (!clean) {
-            var source_lines = Lines{ .text = cleaned };
-            var count: usize = 0;
-            while (source_lines.next() != null) count += 1;
-            for (diagnostics.array.items) |diagnostic| { // llvm-ir: memcpy (16 bytes)
-                if (!std.mem.eql(u8, diagnostic.object.get("path").?.string, source)) continue; // llvm-ir: memcpy (16 bytes)
-                const line = diagnostic.object.get("line").?.integer; // llvm-ir: memcpy (16 bytes)
-                if (line <= 0 or line > count) try skipped.append(a, try std.fmt.allocPrint(a, "{s}:{d}", .{ source, line })); // llvm-ir: not inlined: "array_list.Aligned([]const u8,null).append"
-            }
+        var source_lines = Lines{ .text = cleaned };
+        var count: usize = 0;
+        while (source_lines.next() != null) count += 1;
+        for (diagnostics.array.items) |diagnostic| { // llvm-ir: memcpy (16 bytes)
+            if (!std.mem.eql(u8, diagnostic.object.get("path").?.string, source)) continue; // llvm-ir: memcpy (16 bytes)
+            const line = diagnostic.object.get("line").?.integer; // llvm-ir: memcpy (16 bytes)
+            if (line <= 0 or line > count) try skipped.append(a, try std.fmt.allocPrint(a, "{s}:{d}", .{ source, line })); // llvm-ir: not inlined: "array_list.Aligned([]const u8,null).append"
         }
         var lines = Lines{ .text = cleaned };
         var number: usize = 0;
@@ -667,7 +659,7 @@ pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8
         while (lines.next()) |line| {
             number += 1;
             var messages: std.ArrayList([]const u8) = .empty; // llvm-ir: memcpy (32 bytes)
-            if (!clean) for (diagnostics.array.items) |diagnostic| { // llvm-ir: memcpy (32 bytes)
+            for (diagnostics.array.items) |diagnostic| { // llvm-ir: memcpy (32 bytes)
                 if (!std.mem.eql(u8, diagnostic.object.get("path").?.string, source) or diagnostic.object.get("line").?.integer != number) continue; // llvm-ir: memcpy (32 bytes)
                 if (std.mem.eql(u8, diagnostic.object.get("kind").?.string, "call")) { // llvm-ir: memcpy (16 bytes)
                     // Don't mark Zig panic as inlining failures, because those are never inlined and shouldn't either
@@ -676,7 +668,7 @@ pub fn apply(a: Allocator, io: std.Io, report: json.Value, workspace: []const u8
                         continue;
                 }
                 try messages.append(a, try description(a, diagnostic)); // llvm-ir: not inlined: "array_list.Aligned([]const u8,null).append"
-            };
+            }
             if (messages.items.len == 0 or std.mem.startsWith(u8, std.mem.trim(u8, line, whitespace), "\\\\")) {
                 if (messages.items.len > 0) try skipped.append(a, try std.fmt.allocPrint(a, "{s}:{d}", .{ source, number })); // llvm-ir: not inlined: "array_list.Aligned([]const u8,null).append"
                 try updated.appendSlice(a, line);
@@ -853,7 +845,7 @@ test "unoptimized or stripped metadata is rejected" {
     try std.testing.expectError(error.ExpectedOptimizedDICompileUnit, analyze(a, &unoptimized, "input.ll"));
 }
 
-test "version-2 annotations map workspace paths and support repeat and clean" {
+test "version-2 annotations map workspace paths and support repeated application" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -876,14 +868,12 @@ test "version-2 annotations map workspace paths and support repeat and clean" {
     , .{ .allocate = .alloc_always })).value;
     // Absolute and relative debug paths must refer to the same workspace file.
     try report.object.getPtr("diagnostics").?.array.items[1].object.put(a, "path", .{ .string = path });
-    const result = try apply(a, io, report, root, false);
+    const result = try apply(a, io, report, root);
     try std.testing.expectEqual(@as(usize, 1), result.count);
     try std.testing.expectEqual(@as(usize, 2), result.skipped.len);
     const annotated = try tmp.dir.readFileAlloc(io, "source.zig", a, .unlimited);
     try std.testing.expect(std.mem.indexOf(u8, annotated, "// original // llvm-ir: memcpy (8 bytes); not inlined: \"foo\"" ++ eol) != null);
-    try std.testing.expectEqual(@as(usize, 0), (try apply(a, io, report, root, false)).count);
-    try std.testing.expectEqual(@as(usize, 1), (try apply(a, io, report, root, true)).count);
-    try std.testing.expectEqualStrings(original, try tmp.dir.readFileAlloc(io, "source.zig", a, .unlimited));
+    try std.testing.expectEqual(@as(usize, 0), (try apply(a, io, report, root)).count);
 }
 
 test "streaming IR skips oversized lines and preserves locations across refills" {
