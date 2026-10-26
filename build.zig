@@ -20,6 +20,22 @@ pub fn addAnalysis(b: *std.Build, exe: *std.Build.Step.Compile) std.Build.LazyPa
     run.addArg("--output");
     return run.addOutputFileArg("analysis.json");
 }
+/// Analyze `exe`, then annotate files inside `workspace` in place.
+/// Pass null to use the executable's build root. Attach the returned run step
+/// to an explicit build step; it always runs because it modifies source files.
+/// The run step accepts additional CLI flags such as --check or --remove.
+pub fn addAnnotations(b: *std.Build, report: std.Build.LazyPath, workspace: ?std.Build.LazyPath) *std.Build.Step.Run {
+    const run = b.addRunArtifact(analyzer(b, b.graph.host, .safe));
+    run.addArgs(&.{ "apply", "--report" });
+    run.addFileArg(report);
+    if (workspace) |wk| {
+        run.addArg("--workspace");
+        run.addDirectoryArg2(wk, .{ .make_absolute = true });
+    }
+    run.has_side_effects = true;
+    return run;
+}
+
 fn analyzer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     return b.addExecutable(.{
         .name = "llvm-inline-annotations",
@@ -42,6 +58,9 @@ pub fn build(b: *std.Build) void {
         const report = addAnalysis(b, exe);
         const install_report = b.addInstallFile(report, "analysis.json");
         b.step("self-report", "Generates self report").dependOn(&install_report.step);
+
+        const annotate = addAnnotations(b, report, exe.step.owner.path("."));
+        b.step("self-annotate", "Annotate our codebase").dependOn(&annotate.step);
     }
 
     {

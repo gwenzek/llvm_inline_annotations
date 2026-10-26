@@ -81,5 +81,35 @@ modules inherit these settings. The analyzer runs on the host for cross builds.
 `zig build test` runs native Zig tests for parsing, aggregation, IR references,
 Unicode, and preserving debug paths without reading source files.
 
-The retained `apply` command supports legacy version-1 reports with source hashes;
-it does not accept the new version-2 summaries.
+## Source annotations
+
+`addAnnotations` analyzes the executable and returns a run step that applies
+trailing `// llvm-ir: ...` comments to files in a workspace:
+
+```zig
+const annotate = annotations.addAnnotations(dep.builder, exe, b.path("."));
+b.step("annotate", "Annotate sources with LLVM findings").dependOn(&annotate.step);
+```
+
+Pass `null` for the workspace to use the executable's build root. Like
+`addAnalysis`, pass this package's builder as the first argument. The run step is
+marked as having side effects and runs whenever requested. It is not attached to
+the default build. You can add `--check`, `--remove`, or repeated `--prefix DIR`
+arguments to the returned run step.
+
+```sh
+zig build run -- apply --report analysis.json --workspace "$PWD" --check
+zig build run -- apply --report analysis.json --workspace "$PWD"
+zig build run -- apply --report analysis.json --workspace "$PWD" --remove
+```
+
+Absolute debug paths must resolve inside the workspace; relative paths resolve
+against it. External files, escaping symlinks, and files under `.zig-cache`,
+`zig-out`, or `.git` are excluded. Missing files, out-of-range source lines, and
+multiline string locations are skipped. All workspace files represented in the
+report are eligible by default; `--prefix` narrows this set. Reapplying replaces
+existing annotations, preserving other comments and line endings. Removal only
+affects files represented in the supplied report.
+
+Analysis reports are short-lived build outputs. Only the current format is
+supported; regenerate the analysis before annotating changed sources.
